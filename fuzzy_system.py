@@ -1,8 +1,34 @@
 import numpy as np
 from scipy.signal import find_peaks
-import matplotlib.pyplot as plt
 import skfuzzy as fuzz
 from skfuzzy import control as ctrl
+import firebase_admin
+from firebase_admin import credentials, db
+from datetime import datetime
+import uuid
+import os
+
+# Ensure Firebase credentials are set securely
+
+# Function to fetch patient's Date of Birth from Firebase and calculate age
+def get_patient_age(patient_id):
+    ref = db.reference(f"/Patient/{patient_id}/Date_of_birth")
+    dob_str = ref.get()
+    if dob_str:
+        dob = datetime.strptime(dob_str, "%d/%m/%Y")
+        today = datetime.today()
+        age = today.year - dob.year - ((today.month, today.day) < (dob.month, dob.day))
+        return age
+    return None
+
+# Function to send alert to Firebase
+def send_alert_to_firebase(patient_id, alert_message, reason):
+    alert_ref = db.reference(f"/Patient/{patient_id}/Alert")
+    alert_ref.child(str(uuid.uuid4())).set({
+        "message": alert_message,
+        "reason": reason,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
 
 # Function to calculate Respiratory Rate from accelerometer data
 def calculate_respiratory_rate(accelerometer_data, sampling_rate=50):
@@ -31,67 +57,63 @@ def calculate_oxygen_saturation(ppg_red, ppg_ir):
     spo2 = 110 - 25 * (ac_red / dc_red) / (ac_ir / dc_ir)
     return np.clip(spo2, 85, 100)
 
-# Define fuzzy variables
-oxygen_saturation = ctrl.Antecedent(np.arange(85, 101, 1), 'oxygen_saturation')
-respiratory_rate = ctrl.Antecedent(np.arange(10, 60, 1), 'respiratory_rate')
-cough_count = ctrl.Antecedent(np.arange(0, 20, 1), 'cough_count')
-sleep_interruptions = ctrl.Antecedent(np.arange(0, 10, 1), 'sleep_interruptions')
-heart_rate = ctrl.Antecedent(np.arange(50, 150, 1), 'heart_rate')
-temperature = ctrl.Antecedent(np.arange(35, 41, 0.1), 'temperature')
-status = ctrl.Consequent(np.arange(0, 1.1, 0.1), 'status')
+# Define function to determine patient category
+def get_patient_category(age):
+    if age is None:
+        return 'unknown'
+    elif age < 1:
+        return 'infant'
+    elif age < 5:
+        return 'preschooler'
+    elif age < 13:
+        return 'school_age'
+    else:
+        return 'adult'
 
-# Membership functions
-oxygen_saturation.automf(3)
-respiratory_rate.automf(3)
-cough_count.automf(3)
-sleep_interruptions.automf(3)
-heart_rate.automf(3)
-temperature.automf(3)
-status.automf(3)
+# Define patient-specific thresholds using exact values from tables
+def get_thresholds(category):
+    if category == 'infant':
+        return {'oxygen_saturation': 94, 'respiratory_rate': 60, 'heart_rate_low': 60, 'heart_rate_high': 120}
+    elif category == 'preschooler':
+        return {'oxygen_saturation': 94, 'respiratory_rate': 40, 'heart_rate_low': 60, 'heart_rate_high': 110}
+    elif category == 'school_age':
+        return {'oxygen_saturation': 94, 'respiratory_rate': 30, 'heart_rate_low': 60, 'heart_rate_high': 100}
+    elif category == 'adult':
+        return {'oxygen_saturation': 92, 'respiratory_rate': 25, 'heart_rate_low': 60, 'heart_rate_high': 100}
+    return None
 
-# Define rules
-rule1 = ctrl.Rule(oxygen_saturation['poor'] | respiratory_rate['poor'] | cough_count['poor'] | sleep_interruptions['poor'] | heart_rate['poor'] | temperature['poor'], status['poor'])
-rule2 = ctrl.Rule(oxygen_saturation['good'] & respiratory_rate['good'] & cough_count['good'] & sleep_interruptions['good'] & heart_rate['good'] & temperature['good'], status['good'])
-rule3 = ctrl.Rule(oxygen_saturation['average'] | respiratory_rate['average'] | cough_count['average'] | sleep_interruptions['average'] | heart_rate['average'] | temperature['average'], status['average'])
+# Define patient ID
+patient_id = "1"  # Change dynamically if needed
 
-# Control System
-status_ctrl = ctrl.ControlSystem([rule1, rule2, rule3])
-status_simulation = ctrl.ControlSystemSimulation(status_ctrl)
+# Fetch patient age from Firebase
+patient_age = get_patient_age(patient_id)
+category = get_patient_category(patient_age)
+thresh = get_thresholds(category)
 
-# Simulated Data
-time = np.linspace(0, 60, 3000)
-simulated_accelerometer = np.sin(2 * np.pi * 0.25 * time) + np.random.normal(0, 0.1, len(time))
-simulated_ppg_red = np.sin(2 * np.pi * 1.2 * time) + np.random.normal(0, 0.05, len(time))
-simulated_ppg_ir = np.sin(2 * np.pi * 1.1 * time) + np.random.normal(0, 0.05, len(time))
+if category == 'unknown' or not thresh:
+    print("Error: Unable to determine patient category or thresholds.")
+else:
+    # Simulated Data
+    respiratory_rate_value = np.random.uniform(10, 60)
+    oxygen_saturation_value = np.random.uniform(85, 100)
+    heart_rate_value = np.random.uniform(50, 150)
 
-respiratory_rate_value = calculate_respiratory_rate(simulated_accelerometer)
-cough_count_value = np.random.randint(0, 15)
-sleep_interruptions_value = np.random.randint(0, 10)
-oxygen_saturation_value = calculate_oxygen_saturation(simulated_ppg_red, simulated_ppg_ir)
-heart_rate_value = calculate_heart_rate(simulated_ppg_ir)
-temperature_value = np.random.uniform(35, 41)
+    # Check if any value is in high-priority range and log reason
+    reasons = []
+    if oxygen_saturation_value < thresh['oxygen_saturation']:
+        reasons.append(f"Low Oxygen Saturation: {oxygen_saturation_value:.2f}% (<{thresh['oxygen_saturation']}%)")
+    if respiratory_rate_value > thresh['respiratory_rate']:
+        reasons.append(f"High Respiratory Rate: {respiratory_rate_value:.2f} bpm (>{thresh['respiratory_rate']} bpm)")
+    if heart_rate_value < thresh['heart_rate_low'] or heart_rate_value > thresh['heart_rate_high']:
+        reasons.append(f"Abnormal Heart Rate: {heart_rate_value:.2f} bpm (<{thresh['heart_rate_low']} bpm or >{thresh['heart_rate_high']} bpm)")
 
-# Set inputs
-status_simulation.input['oxygen_saturation'] = oxygen_saturation_value
-status_simulation.input['respiratory_rate'] = respiratory_rate_value
-status_simulation.input['cough_count'] = cough_count_value
-status_simulation.input['sleep_interruptions'] = sleep_interruptions_value
-status_simulation.input['heart_rate'] = heart_rate_value
-status_simulation.input['temperature'] = temperature_value
+    if reasons:
+        alert_message = "ALERT: Seek Emergency Care (ER) Immediately!"
+        reason_text = " | ".join(reasons)
+        print(alert_message, reason_text)
+        send_alert_to_firebase(patient_id, alert_message, reason_text)
 
-# Compute output
-status_simulation.compute()
-final_status = status_simulation.output['status']
-
-# Output
-print(f"Status: {final_status:.2f}")
-print(f"Oxygen Saturation: {oxygen_saturation_value:.2f}%, Respiratory Rate: {respiratory_rate_value:.2f} bpm, Heart Rate: {heart_rate_value:.2f} bpm, Body Temperature: {temperature_value:.2f}°C")
-print(f"Cough Count: {cough_count_value}, Sleep Interruptions: {sleep_interruptions_value}")
-
-# Plotting
-plt.figure(figsize=(12, 4))
-plt.plot(time, simulated_accelerometer)
-plt.title('Simulated Accelerometer Data (Chest Movement)')
-plt.xlabel('Time (s)')
-plt.ylabel('Amplitude')
-plt.show()
+    print(f"Category: {category.capitalize()}")
+    print(f"Oxygen Saturation: {oxygen_saturation_value:.2f}% (High Alert if <{thresh['oxygen_saturation']}%)")
+    print(f"Respiratory Rate: {respiratory_rate_value:.2f} bpm (High Alert if >{thresh['respiratory_rate']} bpm)")
+    print(f"Heart Rate: {heart_rate_value:.2f} bpm (High Alert if <{thresh['heart_rate_low']} bpm or >{thresh['heart_rate_high']} bpm)")
