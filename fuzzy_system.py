@@ -6,7 +6,6 @@ import firebase_admin
 from firebase_admin import credentials, db
 from datetime import datetime
 import uuid
-import os
 
 # Ensure Firebase credentials are set securely
 
@@ -22,11 +21,11 @@ def get_patient_age(patient_id):
     return None
 
 # Function to send alert to Firebase
-def send_alert_to_firebase(patient_id, alert_message, reason):
+def send_alert_to_firebase(patient_id, alert_message, risk_level):
     alert_ref = db.reference(f"/Patient/{patient_id}/Alert")
     alert_ref.child(str(uuid.uuid4())).set({
         "message": alert_message,
-        "reason": reason,
+        "risk_level": risk_level,
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     })
 
@@ -57,63 +56,66 @@ def calculate_oxygen_saturation(ppg_red, ppg_ir):
     spo2 = 110 - 25 * (ac_red / dc_red) / (ac_ir / dc_ir)
     return np.clip(spo2, 85, 100)
 
-# Define function to determine patient category
-def get_patient_category(age):
-    if age is None:
-        return 'unknown'
-    elif age < 1:
-        return 'infant'
-    elif age < 5:
-        return 'preschooler'
-    elif age < 13:
-        return 'school_age'
-    else:
-        return 'adult'
+# Fuzzy Logic System
+respiratory_rate = ctrl.Antecedent(np.arange(10, 60, 1), 'respiratory_rate')
+oxygen_saturation = ctrl.Antecedent(np.arange(85, 100, 1), 'oxygen_saturation')
+heart_rate = ctrl.Antecedent(np.arange(50, 150, 1), 'heart_rate')
+risk_level = ctrl.Consequent(np.arange(0, 100, 1), 'risk_level')
 
-# Define patient-specific thresholds using exact values from tables
-def get_thresholds(category):
-    if category == 'infant':
-        return {'oxygen_saturation': 94, 'respiratory_rate': 60, 'heart_rate_low': 60, 'heart_rate_high': 120}
-    elif category == 'preschooler':
-        return {'oxygen_saturation': 94, 'respiratory_rate': 40, 'heart_rate_low': 60, 'heart_rate_high': 110}
-    elif category == 'school_age':
-        return {'oxygen_saturation': 94, 'respiratory_rate': 30, 'heart_rate_low': 60, 'heart_rate_high': 100}
-    elif category == 'adult':
-        return {'oxygen_saturation': 92, 'respiratory_rate': 25, 'heart_rate_low': 60, 'heart_rate_high': 100}
-    return None
+# Define Membership Functions
+respiratory_rate['low'] = fuzz.trimf(respiratory_rate.universe, [10, 15, 20])
+respiratory_rate['normal'] = fuzz.trimf(respiratory_rate.universe, [18, 25, 32])
+respiratory_rate['high'] = fuzz.trimf(respiratory_rate.universe, [30, 40, 60])
 
-# Define patient ID
-patient_id = "1"  # Change dynamically if needed
+oxygen_saturation['low'] = fuzz.trimf(oxygen_saturation.universe, [85, 88, 92])
+oxygen_saturation['normal'] = fuzz.trimf(oxygen_saturation.universe, [90, 95, 100])
 
-# Fetch patient age from Firebase
-patient_age = get_patient_age(patient_id)
-category = get_patient_category(patient_age)
-thresh = get_thresholds(category)
+heart_rate['low'] = fuzz.trimf(heart_rate.universe, [50, 60, 70])
+heart_rate['normal'] = fuzz.trimf(heart_rate.universe, [65, 80, 100])
+heart_rate['high'] = fuzz.trimf(heart_rate.universe, [90, 110, 150])
 
-if category == 'unknown' or not thresh:
-    print("Error: Unable to determine patient category or thresholds.")
+risk_level['low'] = fuzz.trimf(risk_level.universe, [0, 20, 40])
+risk_level['moderate'] = fuzz.trimf(risk_level.universe, [30, 50, 70])
+risk_level['high'] = fuzz.trimf(risk_level.universe, [60, 80, 100])
+
+# Define Rules
+rule1 = ctrl.Rule(respiratory_rate['high'] | oxygen_saturation['low'] | heart_rate['high'], risk_level['high'])
+rule2 = ctrl.Rule(respiratory_rate['normal'] & oxygen_saturation['normal'] & heart_rate['normal'], risk_level['low'])
+rule3 = ctrl.Rule(respiratory_rate['low'] | heart_rate['low'], risk_level['moderate'])
+
+# Create and Simulate Fuzzy Controller
+risk_ctrl = ctrl.ControlSystem([rule1, rule2, rule3])
+risk_simulation = ctrl.ControlSystemSimulation(risk_ctrl)
+
+# Simulated Patient Data
+respiratory_rate_value = np.random.uniform(10, 60)
+oxygen_saturation_value = np.random.uniform(85, 100)
+heart_rate_value = np.random.uniform(50, 150)
+
+# Set Inputs
+risk_simulation.input['respiratory_rate'] = respiratory_rate_value
+risk_simulation.input['oxygen_saturation'] = oxygen_saturation_value
+risk_simulation.input['heart_rate'] = heart_rate_value
+
+# Compute Risk Level
+risk_simulation.compute()
+final_risk = risk_simulation.output['risk_level']
+
+# Determine Severity Category
+if final_risk < 30:
+    severity = "Low"
+elif final_risk < 60:
+    severity = "Moderate"
+elif final_risk < 80:
+    severity = "High"
 else:
-    # Simulated Data
-    respiratory_rate_value = np.random.uniform(10, 60)
-    oxygen_saturation_value = np.random.uniform(85, 100)
-    heart_rate_value = np.random.uniform(50, 150)
+    severity = "Severe"
 
-    # Check if any value is in high-priority range and log reason
-    reasons = []
-    if oxygen_saturation_value < thresh['oxygen_saturation']:
-        reasons.append(f"Low Oxygen Saturation: {oxygen_saturation_value:.2f}% (<{thresh['oxygen_saturation']}%)")
-    if respiratory_rate_value > thresh['respiratory_rate']:
-        reasons.append(f"High Respiratory Rate: {respiratory_rate_value:.2f} bpm (>{thresh['respiratory_rate']} bpm)")
-    if heart_rate_value < thresh['heart_rate_low'] or heart_rate_value > thresh['heart_rate_high']:
-        reasons.append(f"Abnormal Heart Rate: {heart_rate_value:.2f} bpm (<{thresh['heart_rate_low']} bpm or >{thresh['heart_rate_high']} bpm)")
+alert_message = f"Risk Level: {severity}. Seek medical attention if needed."
+print(alert_message)
+send_alert_to_firebase("1", alert_message, severity)
 
-    if reasons:
-        alert_message = "ALERT: Seek Emergency Care (ER) Immediately!"
-        reason_text = " | ".join(reasons)
-        print(alert_message, reason_text)
-        send_alert_to_firebase(patient_id, alert_message, reason_text)
-
-    print(f"Category: {category.capitalize()}")
-    print(f"Oxygen Saturation: {oxygen_saturation_value:.2f}% (High Alert if <{thresh['oxygen_saturation']}%)")
-    print(f"Respiratory Rate: {respiratory_rate_value:.2f} bpm (High Alert if >{thresh['respiratory_rate']} bpm)")
-    print(f"Heart Rate: {heart_rate_value:.2f} bpm (High Alert if <{thresh['heart_rate_low']} bpm or >{thresh['heart_rate_high']} bpm)")
+print(f"Respiratory Rate: {respiratory_rate_value:.2f} bpm")
+print(f"Oxygen Saturation: {oxygen_saturation_value:.2f}%")
+print(f"Heart Rate: {heart_rate_value:.2f} bpm")
+print(f"Final Risk Level: {final_risk:.2f} ({severity})")
